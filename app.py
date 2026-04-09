@@ -713,7 +713,8 @@ with tab5:
         @st.cache_data(ttl=3600, show_spinner="Running sensitivity analysis...")
         def run_sensitivity(tickers_tuple, returns_json, rf, windows_json):
             import json
-            rets = pd.read_json(returns_json)
+            import io
+            rets = pd.read_csv(io.StringIO(returns_json), index_col=0, parse_dates=True)
             windows = json.loads(windows_json)
             results = {}
             bounds = [(0, 1)] * len(tickers_tuple)
@@ -763,14 +764,15 @@ with tab5:
             return results
 
         import json
+        import io
         with st.spinner("Running sensitivity analysis..."):
+            returns_csv = returns.to_csv()
             sens_results = run_sensitivity(
                 tuple(tickers),
-                returns.to_json(),
+                returns_csv,
                 rf_rate,
                 json.dumps({k: v for k, v in available_windows.items()})
             )
-
         # GMV comparison table
         st.subheader("GMV Portfolio — Across Lookback Windows")
         gmv_rows = {}
