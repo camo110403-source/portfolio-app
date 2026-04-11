@@ -7,10 +7,69 @@ import plotly.express as px
 from scipy import stats
 from scipy.optimize import minimize
 import datetime
+import io
+import json
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Portfolio Analytics", layout="wide")
 st.title("Interactive Portfolio Analytics")
+
+# ── Cached optimization helpers ────────────────────────────────────────────────
+@st.cache_data(ttl=3600, show_spinner=False)
+def run_portfolio_optimization(returns_csv, rf):
+    """Cache GMV and tangency optimization so slider interactions don't re-run it."""
+    rets = pd.read_csv(io.StringIO(returns_csv), index_col=0, parse_dates=True)
+    mu = rets.mean()
+    cov = rets.cov()
+    n = len(rets.columns)
+    bounds = [(0, 1)] * n
+    constraints = {"type": "eq", "fun": lambda w: np.sum(w) - 1}
+    w0 = np.array([1 / n] * n)
+
+    def _vol(w):
+        return np.sqrt(w @ cov.values @ w) * np.sqrt(252)
+
+    def _neg_sharpe(w):
+        r = np.sum(mu * w) * 252
+        v = np.sqrt(w @ cov.values @ w) * np.sqrt(252)
+        return -(r - rf) / v
+
+    gmv_res = minimize(_vol, w0, method="SLSQP", bounds=bounds, constraints=constraints)
+    tan_res = minimize(_neg_sharpe, w0, method="SLSQP", bounds=bounds, constraints=constraints)
+    return (
+        gmv_res.x.tolist() if gmv_res.success else None,
+        gmv_res.success,
+        tan_res.x.tolist() if tan_res.success else None,
+        tan_res.success,
+    )
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def compute_efficient_frontier(returns_csv, rf, n_points=80):
+    """Cache the efficient frontier computation (80 minimize calls)."""
+    rets = pd.read_csv(io.StringIO(returns_csv), index_col=0, parse_dates=True)
+    mu = rets.mean()
+    cov = rets.cov()
+    n = len(rets.columns)
+    bounds = [(0, 1)] * n
+    w0 = np.array([1 / n] * n)
+
+    def _vol(w):
+        return np.sqrt(w @ cov.values @ w) * np.sqrt(252)
+
+    target_returns = np.linspace(mu.min() * 252, mu.max() * 252, n_points)
+    frontier_vols, frontier_rets = [], []
+    for target in target_returns:
+        cons = [
+            {"type": "eq", "fun": lambda w: np.sum(w) - 1},
+            {"type": "eq", "fun": lambda w, t=target: np.sum(mu * w) * 252 - t},
+        ]
+        res = minimize(_vol, w0, method="SLSQP", bounds=bounds, constraints=cons)
+        if res.success:
+            frontier_vols.append(res.fun)
+            frontier_rets.append(target)
+    return frontier_vols, frontier_rets
+
 
 # ── Sidebar inputs ─────────────────────────────────────────────────────────────
 st.sidebar.header("Portfolio Settings")
@@ -97,6 +156,13 @@ if bad_tickers:
     st.warning(f"Dropping {bad_tickers} due to >5% missing data.")
     prices = prices.drop(columns=bad_tickers)
     tickers = [t for t in tickers if t not in bad_tickers]
+
+if len(tickers) < 3:
+    st.error(
+        f"After removing tickers with insufficient data, fewer than 3 valid tickers remain "
+        f"({', '.join(tickers) if tickers else 'none'}). Please select different tickers."
+    )
+    st.stop()
 
 prices = prices.dropna()
 if benchmark is not None:
@@ -419,35 +485,19 @@ with tab4:
 
     st.divider()
 
-    # ── Optimization ───────────────────────────────────────────────────────────
-    constraints = {"type": "eq", "fun": lambda w: np.sum(w) - 1}
-    bounds = [(0, 1)] * n
-    w0 = ew_weights
-
-    # GMV
-    def neg_sharpe(w):
-        r = np.sum(mean_returns * w) * 252
-        v = np.sqrt(w @ cov_matrix.values @ w) * np.sqrt(252)
-        return -(r - rf_rate) / v
-
-    def portfolio_vol(w):
-        return np.sqrt(w @ cov_matrix.values @ w) * np.sqrt(252)
-
+    # ── Optimization (cached) ──────────────────────────────────────────────────
     with st.spinner("Running portfolio optimization..."):
-        gmv_result = minimize(portfolio_vol, w0, method="SLSQP",
-                              bounds=bounds, constraints=constraints)
-        tan_result = minimize(neg_sharpe, w0, method="SLSQP",
-                              bounds=bounds, constraints=constraints)
+        returns_csv = returns.to_csv()
+        gmv_w_list, gmv_ok, tan_w_list, tan_ok = run_portfolio_optimization(returns_csv, rf_rate)
 
-    if not gmv_result.success:
-        st.error("GMV optimization did not converge.")
-        st.stop()
-    if not tan_result.success:
-        st.error("Tangency optimization did not converge.")
-        st.stop()
+    if not gmv_ok:
+        st.error("GMV optimization did not converge. Try different tickers or a longer date range.")
+    if not tan_ok:
+        st.error("Tangency optimization did not converge. Try different tickers or a longer date range.")
 
-    gmv_weights = gmv_result.x
-    tan_weights = tan_result.x
+    _opt_ok = gmv_ok and tan_ok
+    gmv_weights = np.array(gmv_w_list) if gmv_ok else ew_weights
+    tan_weights = np.array(tan_w_list) if tan_ok else ew_weights
 
     # ── Display GMV ────────────────────────────────────────────────────────────
     st.subheader("Global Minimum Variance (GMV) Portfolio")
@@ -531,9 +581,9 @@ with tab4:
     total = sum(raw_weights)
     if total == 0:
         st.error("At least one weight must be greater than zero.")
-        st.stop()
-
-    custom_weights = np.array(raw_weights) / total
+        custom_weights = ew_weights  # fallback so downstream code still runs
+    else:
+        custom_weights = np.array(raw_weights) / total
     st.markdown("**Normalized Weights:**")
     norm_df = pd.DataFrame({"Ticker": tickers, "Weight": [f"{w:.2%}" for w in custom_weights]})
     st.dataframe(norm_df.set_index("Ticker").T)
@@ -552,19 +602,8 @@ with tab4:
     st.subheader("Efficient Frontier")
     st.caption("The efficient frontier shows the set of portfolios with the highest return for a given level of risk. The Capital Allocation Line (CAL) connects the risk-free rate to the tangency portfolio — any point on the CAL represents a mix of the risk-free asset and the tangency portfolio.")
 
-    target_returns = np.linspace(mean_returns.min() * 252, mean_returns.max() * 252, 80)
-    frontier_vols = []
-    frontier_rets = []
-
-    for target in target_returns:
-        cons = [
-            {"type": "eq", "fun": lambda w: np.sum(w) - 1},
-            {"type": "eq", "fun": lambda w, t=target: np.sum(mean_returns * w) * 252 - t}
-        ]
-        res = minimize(portfolio_vol, w0, method="SLSQP", bounds=bounds, constraints=cons)
-        if res.success:
-            frontier_vols.append(res.fun)
-            frontier_rets.append(target)
+    with st.spinner("Computing efficient frontier..."):
+        frontier_vols, frontier_rets = compute_efficient_frontier(returns_csv, rf_rate)
 
     fig_ef = go.Figure()
 
@@ -619,13 +658,16 @@ with tab4:
         ))
 
     # Capital Allocation Line
-    cal_vols = np.linspace(0, max(frontier_vols) * 1.2, 100)
-    cal_rets = rf_rate + (tan_sharpe) * cal_vols
-    fig_ef.add_trace(go.Scatter(
-        x=cal_vols, y=cal_rets,
-        mode="lines", name="CAL",
-        line=dict(dash="dash", color="orange", width=1.5)
-    ))
+    if frontier_vols:
+        cal_vols = np.linspace(0, max(frontier_vols) * 1.2, 100)
+        cal_rets = rf_rate + tan_sharpe * cal_vols
+        fig_ef.add_trace(go.Scatter(
+            x=cal_vols, y=cal_rets,
+            mode="lines", name="CAL",
+            line=dict(dash="dash", color="orange", width=1.5)
+        ))
+    else:
+        st.warning("Could not compute efficient frontier — optimizations did not converge.")
 
     fig_ef.update_layout(
         title="Efficient Frontier with CAL",
