@@ -116,20 +116,49 @@ if (end_date - start_date).days < 730:
 # ── Data download ──────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner="Downloading data...")
 def load_data(tickers, start, end):
+    import time
     all_tickers = list(tickers) + ["^GSPC"]
     raw_data = {}
     failed = []
 
     for ticker in all_tickers:
-        try:
-            df = yf.download(ticker, start=start, end=end,
-                             progress=False, auto_adjust=True)
-            if df.empty or len(df) < 100:
+        success = False
+        for attempt in range(3):          # retry up to 3 times for transient failures
+            try:
+                df = yf.download(ticker, start=start, end=end,
+                                 progress=False, auto_adjust=True)
+                if df.empty:
+                    if attempt < 2:
+                        time.sleep(1.5)
+                        continue
+                    failed.append(ticker)
+                    break
+
+                # Handle both single-level and multi-level columns (yfinance >= 0.2.x)
+                if isinstance(df.columns, pd.MultiIndex):
+                    close = df["Close"].iloc[:, 0]
+                else:
+                    close = df["Close"]
+
+                close = close.squeeze()
+
+                # Need at least 50 rows (lenient — handles short date ranges near minimum)
+                if len(close.dropna()) < 50:
+                    if attempt < 2:
+                        time.sleep(1.5)
+                        continue
+                    failed.append(ticker)
+                    break
+
+                raw_data[ticker] = close
+                success = True
+                break
+            except Exception:
+                if attempt < 2:
+                    time.sleep(1.5)
+                    continue
                 failed.append(ticker)
-            else:
-                raw_data[ticker] = df["Close"]
-        except Exception:
-            failed.append(ticker)
+                break
 
     return raw_data, failed
 
